@@ -12,10 +12,14 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tsconfig/svelte": "^5.0.4",
+    "@types/pdfjs-dist": "^2.10.378",
     "svelte": "^5.2.7",
     "svelte-check": "^4.1.0",
     "tslib": "^2.8.1",
     "typescript": "~5.6.2",
     "vite": "^6.0.1"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
   }
 }

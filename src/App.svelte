@@ -1,6 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { writable } from "svelte/store";
+  import { PDFDocument } from "pdf-lib";
+  import Annotation from "./components/Annotation.svelte";
+  import type { AnnotationBox } from "./types/canvas";
+  import type { PDFDocumentProxy } from "pdfjs-dist";
 
   // Types for better type safety
   interface Coordinates {
@@ -8,37 +12,41 @@
     y: number;
   }
 
-  interface AnnotationBox {
-    id: number;
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    name: string;
-  }
-
+  /** ref for file input field*/
   let fileInput: HTMLInputElement;
+  /** ref for page input field*/
   let pageInput: HTMLInputElement;
+  /** ref for pdf canvas container*/
   let pdfCanvasContainer: HTMLDivElement;
+  /** ref for pdf canvas, rendered the actual PDF */
   let pdfCanvas: HTMLCanvasElement;
+  /** ref for annotation canvas, rendered the annotations, not written to actual pdf so that edits don't need rerendering whole pdf */
+  let annotationCanvas: HTMLCanvasElement;
+  /** ref for drawing canvas, rendered the temporary box while drawing */
   let drawingCanvas: HTMLCanvasElement;
+  /** ref for pdf context*/
   let pdfContext: CanvasRenderingContext2D | null = null;
+  /** ref for annotation context*/
+  let annotationContext: CanvasRenderingContext2D | null = null;
+  /** ref for drawing context*/
   let drawingContext: CanvasRenderingContext2D | null = null;
 
-  let pdfDocument = writable<any>(null);
+  /** store for pdf document*/
+  let pdfDocument = writable<PDFDocumentProxy | null>(null);
+  /** store for current page*/
   let currentPage = writable<number>(1);
+  /** store for number of pages*/
   let numPages = writable<number>(0);
+  /** store for coordinates*/
   let coordinates = writable<Coordinates>({ x: 0, y: 0 });
 
   // New stores for box drawing
   let annotations = writable<AnnotationBox[]>([]);
-  let isDrawing = writable<boolean>(false);
-  let currentBox = writable<AnnotationBox | null>(null);
+  let isDrawing = false;
+  let currentBox: AnnotationBox | null = null;
   let selectedAnnotationId = writable<number | null>(null);
 
-  let pdfUrl = "";
   let scale = 1.5;
-  let newBoxName = "";
 
   // Keyboard event listener reference
   let keyboardListener: ((event: KeyboardEvent) => void) | null = null;
@@ -78,7 +86,8 @@
 
   // Load PDF
   const loadPdf = async (pdfData: Uint8Array): Promise<void> => {
-    const loadedPdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
+    const loadedPdf = await window.pdfjsLib.getDocument({ data: pdfData })
+      .promise;
     pdfDocument.set(loadedPdf);
     numPages.set(loadedPdf.numPages);
     renderPage(1);
@@ -87,36 +96,47 @@
   // Render page with optimized canvas handling
   const renderPage = async (pageNumber: number): Promise<void> => {
     const pdf = $pdfDocument;
+    if (!pdf) return;
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale: 1 });
     // get actual width of page
     const pdfWidth = viewport.width;
     const pdfHeight = viewport.height;
 
-    // Create a new canvas for rendering
+    // Create a new canvases for rendering
     const renderViewport = page.getViewport({ scale });
     pdfCanvas.width = renderViewport.width;
     pdfCanvas.height = renderViewport.height;
+    annotationCanvas.width = renderViewport.width;
+    annotationCanvas.height = renderViewport.height;
     drawingCanvas.width = renderViewport.width;
     drawingCanvas.height = renderViewport.height;
 
-    const newContext = pdfCanvas.getContext("2d");
-    const tempContext = drawingCanvas.getContext("2d");
-    if (!newContext || !tempContext) {
+    pdfContext = pdfCanvas.getContext("2d");
+    annotationContext = annotationCanvas.getContext("2d");
+    drawingContext = drawingCanvas.getContext("2d");
+    if (!pdfContext || !drawingContext || !annotationContext) {
       console.error("Could not get canvas context");
+      // Reset ctx variables
+      pdfContext = null;
+      drawingContext = null;
+      annotationContext = null;
       return;
     }
-    newContext.clearRect(0, 0, renderViewport.width, renderViewport.height);
-    tempContext.clearRect(0, 0, renderViewport.width, renderViewport.height);
+    pdfContext.clearRect(0, 0, renderViewport.width, renderViewport.height);
+    annotationContext.clearRect(
+      0,
+      0,
+      renderViewport.width,
+      renderViewport.height
+    );
+    drawingContext.clearRect(0, 0, renderViewport.width, renderViewport.height);
 
     const renderContext = {
-      canvasContext: newContext,
+      canvasContext: pdfContext,
       viewport: renderViewport,
     };
-    await page.render(renderContext);
-
-    pdfContext = newContext;
-    drawingContext = tempContext;
+    await page.render(renderContext).promise;
 
     // Render existing annotations
     renderAnnotations();
@@ -149,19 +169,21 @@
 
   // Render all annotations
   const renderAnnotations = () => {
-    if (!pdfContext || !drawingCanvas || !drawingContext) return;
+    if (!pdfContext || !drawingContext || !annotationContext) return;
 
     // Clear previous annotations
-    drawingContext.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+    annotationContext.clearRect(
+      0,
+      0,
+      drawingCanvas.width,
+      drawingCanvas.height
+    );
 
     // Draw existing annotations
     $annotations.forEach((box) => {
-      drawingContext!.strokeStyle = "rgba(0, 0, 255, 0.5)";
-      drawingContext!.strokeRect(box.x, box.y, box.width, box.height);
+      annotationContext!.strokeStyle = "rgba(0, 0, 255, 0.5)";
+      annotationContext!.strokeRect(box.x, box.y, box.width, box.height);
     });
-
-    // Copy temporary canvas to main canvas
-    pdfContext.drawImage(drawingCanvas, 0, 0);
   };
 
   // Box drawing methods
@@ -175,25 +197,26 @@
     // Clear temporary canvas
     drawingContext.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
 
-    isDrawing.set(true);
-    currentBox.set({
+    isDrawing = true;
+    currentBox = {
       id: Date.now(),
       x,
       y,
+      page: $currentPage,
       width: 0,
       height: 0,
       name: "",
-    });
+    };
   };
 
   const updateDrawingBox = (event: MouseEvent) => {
-    if (!$isDrawing || !drawingContext || !pdfContext) return;
+    if (!isDrawing || !drawingContext || !pdfContext) return;
 
     const rect = pdfCanvas.getBoundingClientRect();
     const currentX = event.clientX - rect.left;
     const currentY = event.clientY - rect.top;
 
-    const box = $currentBox;
+    const box = currentBox;
     if (box) {
       // Clear temporary canvas and redraw existing annotations
       drawingContext.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
@@ -206,34 +229,36 @@
         currentX - box.x,
         currentY - box.y
       );
-      currentBox.set({
+      currentBox = {
         ...box,
         width: currentX - box.x,
         height: currentY - box.y,
-      });
+      };
     }
   };
 
   const endDrawingBox = () => {
-    if (!$isDrawing || !$currentBox || !pdfContext || !drawingContext) return;
+    if (
+      !isDrawing ||
+      !currentBox ||
+      !pdfContext ||
+      !drawingContext ||
+      !annotationContext
+    )
+      return;
 
-    const box = $currentBox;
-    if (box.width !== 0 && box.height !== 0) {
-      annotations.update((boxes) => [
-        ...boxes,
-        {
-          ...box,
-        },
-      ]);
+    const box = currentBox;
+    if (box && box.width !== 0 && box.height !== 0) {
+      annotations.update((boxes) => [...boxes, box]);
     }
 
-    // Copy temporary canvas to main canvas
-    pdfContext.drawImage(drawingCanvas, 0, 0);
-    // Clear temporary canvas
+    // Copy drawings to annotations layer
+    annotationContext.drawImage(drawingCanvas, 0, 0);
+    // Clear drawing canvas
     drawingContext.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
 
-    isDrawing.set(false);
-    currentBox.set(null);
+    isDrawing = false;
+    currentBox = null;
   };
 
   // Keyboard control for box positioning
@@ -274,28 +299,11 @@
     renderAnnotations();
   };
 
-  // Add name to annotation
-  const addNameToAnnotation = () => {
-    if ($selectedAnnotationId && newBoxName) {
-      annotations.update((boxes) =>
-        boxes.map((box) =>
-          box.id === $selectedAnnotationId ? { ...box, name: newBoxName } : box
-        )
-      );
-      newBoxName = "";
-    }
-  };
-
   // Remove annotation
   const removeAnnotation = (id: number) => {
     annotations.update((boxes) => boxes.filter((box) => box.id !== id));
     selectedAnnotationId.set(null);
-
-    // Clear and redraw annotations
-    if (drawingContext && pdfContext) {
-      drawingContext.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
-      renderAnnotations();
-    }
+    renderAnnotations();
   };
 
   // Handle page change
@@ -303,6 +311,70 @@
     const pageNumber = parseInt($currentPage.toString(), 10);
     if ($pdfDocument && pageNumber >= 1 && pageNumber <= $numPages) {
       renderPage(pageNumber);
+    }
+  };
+
+  const addFieldsAndDownload = async () => {
+    try {
+      if (!$pdfDocument) return;
+      // Get the original PDF data
+      const pdfBytes = await $pdfDocument.getData();
+
+      // Create a new PDF document
+      const pdfDoc = await PDFDocument.load(pdfBytes);
+
+      // Group annotations by page
+      const pageAnnotationMap: Record<number, AnnotationBox[]> = {};
+      for (const box of $annotations) {
+        if (!pageAnnotationMap[box.page]) pageAnnotationMap[box.page] = [box];
+        else pageAnnotationMap[box.page].push(box);
+      }
+
+      // Add form fields for each annotation
+      for (const [pageNum, boxes] of Object.entries(pageAnnotationMap)) {
+        const page = pdfDoc.getPage(parseInt(pageNum) - 1);
+        const { width: pdfWidth, height: pdfHeight } = page.getSize();
+
+        for (const box of boxes) {
+          const fieldName = box.name || `Field_${box.id}`;
+
+          // Convert canvas coordinates to PDF coordinates
+          const canvasX = box.x;
+          const canvasY = box.y;
+
+          // Use the same conversion logic as in mousemove handler
+          const pdfX = (canvasX / drawingCanvas.width) * pdfWidth;
+          const pdfY = pdfHeight - (canvasY / drawingCanvas.height) * pdfHeight;
+
+          // Convert width and height to PDF scale
+          const pdfBoxWidth = (box.width / drawingCanvas.width) * pdfWidth;
+          const pdfBoxHeight = (box.height / drawingCanvas.height) * pdfHeight;
+
+          // Create text field with converted coordinates
+          const textField = pdfDoc.getForm().createTextField(fieldName);
+          textField.addToPage(page, {
+            x: pdfX,
+            y: pdfY - pdfBoxHeight, // Adjust Y position for height since PDF coordinates start from bottom
+            width: pdfBoxWidth,
+            height: pdfBoxHeight,
+            borderWidth: 0,
+            backgroundColor: undefined,
+          });
+        }
+      }
+
+      // Save and download the PDF
+      const modifiedPdfBytes = await pdfDoc.save();
+      const blob = new Blob([modifiedPdfBytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "annotated.pdf";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Error creating PDF:", error);
+      alert("Error creating PDF. Check console for details.");
     }
   };
 </script>
@@ -331,30 +403,26 @@
       />
     </div>
 
+    <div>
+      <button on:click={addFieldsAndDownload}>Download</button>
+    </div>
+
     <h3>Annotations</h3>
     {#if $annotations.length > 0}
       <div>
         {#each $annotations as annotation (annotation.id)}
-          <div
-            class="annotation-list-item"
-            class:selected-annotation={$selectedAnnotationId === annotation.id}
-            on:click={() => selectedAnnotationId.set(annotation.id)}
-          >
-            <span>{annotation.name || `Box ${annotation.id}`}</span>
-            <button on:click={() => removeAnnotation(annotation.id)}>🗑️</button>
-          </div>
+          <Annotation
+            {annotation}
+            isSelected={annotation.id === $selectedAnnotationId}
+            onSelect={selectedAnnotationId.set}
+            onEdit={(id, name) => {
+              annotations.update((boxes) =>
+                boxes.map((box) => (box.id === id ? { ...box, name } : box))
+              );
+            }}
+            onRemove={removeAnnotation}
+          />
         {/each}
-      </div>
-    {/if}
-
-    {#if $selectedAnnotationId}
-      <div>
-        <input
-          type="text"
-          bind:value={newBoxName}
-          placeholder="Enter box name"
-        />
-        <button on:click={addNameToAnnotation}>Add Name</button>
       </div>
     {/if}
   </div>
@@ -362,6 +430,7 @@
   <div class="pdf-viewer">
     <div class="pdf-container" bind:this={pdfCanvasContainer}>
       <canvas class="pdf-canvas" bind:this={pdfCanvas}></canvas>
+      <canvas class="annotation-canvas" bind:this={annotationCanvas}></canvas>
       <canvas class="drawing-canvas" bind:this={drawingCanvas}></canvas>
     </div>
   </div>
@@ -387,7 +456,8 @@
   .pdf-container {
     position: relative;
   }
-  .drawing-canvas {
+  .drawing-canvas,
+  .annotation-canvas {
     position: absolute;
     inset: 0;
   }
